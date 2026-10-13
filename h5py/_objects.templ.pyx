@@ -115,6 +115,7 @@ if hasattr(os, "register_at_fork"):
 
 import weakref
 import warnings
+from collections import deque
 
 # Will map id(obj) -> weakref(obj), where obj is an ObjectID instance.
 # Objects are added only via ObjectID.__cinit__, and dropped by the weakref system
@@ -172,6 +173,28 @@ def nonlocal_close():
             obj.id = 0
             continue
 
+# HDF5 identifiers of objects deallocated while another thread held the lock,
+# to be released once the lock is acquired (see ObjectID.__dealloc__).
+# Appending to and popping from a deque are atomic.
+cdef object deferred_dec_refs = deque()
+
+cdef void release_deferred() noexcept:
+    """Release the identifiers in deferred_dec_refs; call with the lock held"""
+    cdef hid_t id_
+    if deferred_dec_refs is None:  # During interpreter shutdown
+        return
+    while True:
+        try:
+            id_ = deferred_dec_refs.popleft()
+        except IndexError:
+            return
+        try:
+            if H5Iis_valid(id_) > 0:
+                H5Idec_ref(id_)
+        except Exception:
+            # Closed in the meantime, e.g., with its file
+            pass
+
 # --- End registry code -------------------------------------------------------
 
 
@@ -203,6 +226,7 @@ cdef class ObjectID:
 
     def __cinit__(self, id_):
         with _phil:
+            release_deferred()
             self.id = id_
             self.locked = 0
             self._pyid = id(self)
@@ -213,7 +237,24 @@ cdef class ObjectID:
 
 
     def __dealloc__(self):
+        ### {{if OBJECTS_USE_LOCKING}}
+        # An object may be deallocated in any thread, e.g., by a garbage
+        # collection, including in a thread that another thread holding the
+        # lock is waiting for: e.g., one serving the reads of a Python file
+        # object that HDF5 reads from with the lock held.  Rather than wait for
+        # the lock, and possibly deadlock, defer releasing the identifier.
+        if not _phil.acquire(False):
+            if self.id > 0 and not self.locked and deferred_dec_refs is not None:
+                deferred_dec_refs.append(self.id)
+            self.id = 0
+            return
+        try:
+            self._close(debug_message="DEALLOC - unregistering")
+        finally:
+            _phil.release()
+        ### {{else}}
         self._close(debug_message="DEALLOC - unregistering")
+        ### {{endif}}
 
     # During interpreter shutdown, module attributes are set to None
     # before __dealloc__ and __del__ methods are executed.
@@ -222,6 +263,7 @@ cdef class ObjectID:
     def _close(self, _phil=_phil, warn=warnings.warn, debug_message="CLOSE -"):
         """ Manually close this object. """
         with _phil:
+            release_deferred()
             ### {{if OBJECTS_DEBUG_ID}}
             print(f"{debug_message} {self._pyid} HDF5 id {self.id}")
             ### {{endif}}
