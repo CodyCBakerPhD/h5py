@@ -13,6 +13,7 @@ import time
 import pytest
 
 from h5py import _objects as o
+from h5py import h5f
 from .common import TestCase
 
 
@@ -90,3 +91,31 @@ class TestObjects(TestCase):
                 assert os.WEXITSTATUS(status) == 0
         finally:
             thread.join()
+
+
+@pytest.mark.thread_unsafe(reason="holds the global lock while another thread runs")
+def test_dealloc_while_locked_in_other_thread(writable_file):
+    """An object deallocated while another thread holds the lock (e.g., by a
+    garbage collection in a thread serving the reads of a Python file object)
+    does not wait for the lock, which could deadlock: its identifier is
+    released the next time the lock is acquired."""
+    writable_file["x"] = [1, 2, 3]
+    ids = [writable_file["x"].id]
+
+    def open_datasets():
+        return h5f.get_obj_count(writable_file.id, h5f.OBJ_DATASET)
+
+    assert open_datasets() == 1
+    deallocated = threading.Event()
+
+    def deallocate():
+        ids.clear()
+        deallocated.set()
+
+    with o.phil:
+        thread = threading.Thread(target=deallocate)
+        thread.start()
+        assert deallocated.wait(10)
+    thread.join()
+    o.ObjectID(0)  # Acquires the lock
+    assert open_datasets() == 0
